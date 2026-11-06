@@ -23,6 +23,7 @@ enum Command {
     Reset { force: bool },
     Node { kind: NodeKind, action: NodeAction },
     Relocate { roots: Vec<PathBuf>, case_insensitive: bool, apply: bool },
+    Dedupe { apply: bool },
 }
 
 /// Every file under `folder`, the first path met for each name, walked
@@ -121,6 +122,7 @@ fn usage() -> String {
         "  rbxport-cli folder add <name> [parent]\n",
         "  rbxport-cli folder delete <id>\n",
         "  rbxport-cli relocate <search-dir> [<search-dir> ...] [--case-insensitive] [--apply]\n",
+        "  rbxport-cli dedupe [--apply]\n",
         "  rbxport-cli --help\n",
         "\n",
         "Notes:\n",
@@ -134,6 +136,10 @@ fn usage() -> String {
         "  - Relocate searches the given dirs (recursively) for each missing track's file.\n",
         "    Matches by exact file name first, optionally case-insensitively. Prints a plan;\n",
         "    nothing is written until --apply is given.\n",
+        "  - Dedupe groups rows with the same file size, length and folded title. The copy\n",
+        "    with hot/memory cues wins, then the one with waveform analysis; the rest are\n",
+        "    soft-deleted (playlist memberships included). Prints a plan; nothing is\n",
+        "    written until --apply is given.\n",
     )
     .to_owned()
 }
@@ -266,6 +272,19 @@ where
                 return Err(format!("{}\nError: relocate requires at least one search directory.", usage()));
             }
             Ok(Command::Relocate { roots, case_insensitive, apply })
+        }
+        "dedupe" => {
+            let mut apply = false;
+            for arg in args {
+                match arg.as_str() {
+                    "--apply" | "--write" => apply = true,
+                    "--dry-run" => apply = false,
+                    value => {
+                        return Err(format!("{}\nError: unknown dedupe flag '{value}'.", usage()));
+                    }
+                }
+            }
+            Ok(Command::Dedupe { apply })
         }
         _ => Err(format!("{}\nError: unknown command '{command}'.", usage())),
     }
@@ -712,6 +731,150 @@ fn cmd_relocate(roots: &[PathBuf], case_insensitive: bool, apply: bool) -> Resul
     Ok(())
 }
 
+/// Duplicate groups over the live collection.
+///
+/// There is no content hash: an import is refused only on an identical file
+/// path, so the same audio file added twice under two paths is two rows. Rows
+/// meeting the same (file size, whole-second length, folded title) are almost
+/// certainly one song; anything else risks eating a remix, so it is left for
+/// the user to decide by ear.
+struct DuplicateGroup {
+    title: String,
+    /// `(row, has_cues, has_analysis, date_created)`, plan order: keeper first.
+    candidates: Vec<(usize, usize, bool, String)>,
+}
+
+/// Sort key for a row's registration date; an unknown date sorts last.
+fn date_key(date: &str) -> &str {
+    if date.is_empty() { "9999" } else { date }
+}
+
+fn scan_duplicates(library: &rbl_index::Library) -> Vec<DuplicateGroup> {
+    let mut groups: HashMap<(u64, u32, String), Vec<usize>> = HashMap::new();
+    for row in 0..library.len() {
+        let size = library.file_size[row];
+        if size == 0 {
+            // Cloud or half-registered rows: no file size to agree on.
+            continue;
+        }
+        let key = (
+            size,
+            library.length_sec[row],
+            library.title_folded.get(row).to_lowercase(),
+        );
+        groups.entry(key).or_default().push(row);
+    }
+
+    let mut plan: Vec<DuplicateGroup> = groups
+        .into_iter()
+        .filter(|(_, rows)| rows.len() > 1)
+        .map(|(_key, rows)| {
+            let mut candidates = rows
+                .into_iter()
+                .map(|row| {
+                    let cues = library.cues_of(row as rbl_index::Row).len();
+                    let has_analysis =
+                        library.analysed[row] != 0 && !library.analysis_path.get(row).is_empty();
+                    let date = library.date_created.get(row);
+                    (row, cues, has_analysis, date.to_owned())
+                })
+                .collect::<Vec<_>>();
+            // Plan order, keeper first: cues, then waveform analysis, then the
+            // earliest registration date. A missing date sorts last. The group
+            // key only guards against false matches; ranking never reads it.
+            candidates.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then(b.2.cmp(&a.2))
+                    .then(date_key(&a.3).cmp(date_key(&b.3)))
+                    .then(a.0.cmp(&b.0))
+            });
+            let title = library.title.get(candidates[0].0).to_owned();
+            DuplicateGroup { title, candidates }
+        })
+        .collect();
+    plan.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    plan
+}
+
+fn cmd_dedupe(apply: bool) -> Result<(), String> {
+    let location = detect_library()?;
+    let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly)
+        .map_err(|error| format!("Could not open the library: {error}"))?;
+    let (library, _) = rbl_index::load(&db)
+        .map_err(|error| format!("Could not index the library: {error}"))?;
+
+    let groups = scan_duplicates(&library);
+    if groups.is_empty() {
+        println!("No duplicates; the collection is clean.");
+        return Ok(());
+    }
+
+    println!("{} duplicate group(s).", groups.len());
+    println!("Keeper first: [C] has cues, [A] has waveform analysis. The rest are removed.");
+    let mut removals: Vec<String> = Vec::new();
+    for group in &groups {
+        println!();
+        println!(
+            "\"{}\" — {} row(s) with the same file size and length:",
+            group.title,
+            group.candidates.len()
+        );
+        for (position, (row, cues, has_analysis, date)) in group.candidates.iter().enumerate() {
+            let flags = format!("{}{}", if *cues > 0 { "[C]" } else { "   " }, if *has_analysis { "[A]" } else { "   " });
+            // `folder_path` is the file's full path in this library; the name
+            // column is only joined on when the row stores a bare directory.
+            let dir = library.folder_path.get(*row);
+            let name = library.file_name.get(*row);
+            let path = if name.is_empty() || dir.ends_with(name) {
+                dir.to_owned()
+            } else {
+                format!("{}{name}", std::path::MAIN_SEPARATOR)
+            };
+            let id = library.ids[*row];
+            if position == 0 {
+                println!("  keep   {id:>10} {flags} {date} {path}");
+            } else {
+                println!("  remove {id:>10} {flags} {date} {path}");
+                removals.push(id.to_string());
+            }
+        }
+    }
+
+    println!();
+    if removals.is_empty() {
+        println!("Every group keeps all of its rows (none are removable).");
+        return Ok(());
+    }
+    if !apply {
+        println!(
+            "{} track(s) to remove. Dry run: the library was not changed. Re-run with --apply.",
+            removals.len()
+        );
+        return Ok(());
+    }
+
+    let backup_dir = std::env::temp_dir().join("rbxport-cli-backups");
+    if !backup_dir.exists() {
+        std::fs::create_dir_all(&backup_dir).map_err(|error| format!("Could not create backup dir: {error}"))?;
+    }
+    // One batch delete in one transaction; the writer's automatic pre-change
+    // copy of the library stays on for exactly this kind of edit.
+    let mut writer = rbl_db::write::Writer::open(location, &backup_dir)
+        .map_err(|error| format!("Could not open the library for writing (is rekordbox or rbxport running?): {error}"))?;
+    let changed = writer
+        .delete_tracks(&removals)
+        .map_err(|error| format!("Could not remove the duplicate rows: {error}"))?;
+    println!(
+        "Removed {} of {} candidate row(s) ({} membership row(s) tombstoned). Pre-change backup: {}",
+        removals.len(),
+        removals.len() + groups.len(),
+        changed.rows,
+        backup_dir.display()
+    );
+
+    Ok(())
+}
+
 fn cmd_node(kind: NodeKind, action: NodeAction) -> Result<(), String> {    let location = detect_library()?;
     let backup_dir = std::env::temp_dir().join("rbxport-cli-backups");
     if !backup_dir.exists() {
@@ -1020,6 +1183,7 @@ fn main() {
         Command::Reset { force } => cmd_reset(force),
         Command::Node { kind, action } => cmd_node(kind, action),
         Command::Relocate { roots, case_insensitive, apply } => cmd_relocate(&roots, case_insensitive, apply),
+        Command::Dedupe { apply } => cmd_dedupe(apply),
     };
 
     if let Err(error) = result {
@@ -1092,6 +1256,17 @@ mod tests {
 
         let parsed = super::parse_args_from(vec!["reset".to_owned(), "--force".to_owned()]).unwrap();
         assert!(matches!(parsed, super::Command::Reset { force: true }));
+    }
+
+    #[test]
+    fn parse_dedupe_command_defaults_to_dry_run() {
+        let parsed = super::parse_args_from(vec!["dedupe".to_owned()]).unwrap();
+        assert!(matches!(parsed, super::Command::Dedupe { apply: false }));
+
+        let parsed = super::parse_args_from(vec!["dedupe".to_owned(), "--apply".to_owned()]).unwrap();
+        assert!(matches!(parsed, super::Command::Dedupe { apply: true }));
+
+        assert!(super::parse_args_from(vec!["dedupe".to_owned(), "--loud".to_owned()]).is_err());
     }
 
     #[test]
